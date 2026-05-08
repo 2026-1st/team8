@@ -1,8 +1,8 @@
 ---
-name: Task
-about: 분류가 애매한 일반 작업
-title: "[task] "
-labels: task
+name: etc
+about: 분류가 애매한 일반 작업(chore, rename 등)
+title: "[etc.] "
+labels: etc
 assignees: ""
 ---
 
