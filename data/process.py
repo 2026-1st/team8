@@ -1,48 +1,3 @@
-"""Feature engineering pipeline v4 — Structural features only (no NLP).
-
-v4 설계 원칙:
-  NLP 피처(TF-IDF, TextRank, keyword similarity) 없이,
-  입력 데이터 테이블의 구조에서 직접 추출 가능한 피처만 사용.
-
-피처 그룹:
-  [A] 대출 시계열 lag/통계 (loan_matrix)
-      loan_lag{1..W}, loan_mean/max/min/trend/cv/recent_ratio/accel
-  [B] 인기순위 lag/통계 (rank_matrix)
-      rank_lag{1..W}, rank_mean, rank_trend
-  [C] 핫트렌드 구조 피처 (hot_trends, lag 적용)
-      hot_trend_recency, rank_gain_lag1, hot_trend_count_hist,
-      rank_gain_max_hist, ht_rank_best_hist
-  [D] 도서 메타데이터
-      book_age, kdc_class_enc, bookname_length, publisher_pop_count,
-      loanCnt_total, co_loan_count
-  [E] 시리즈 피처 (vol 컬럼 기반)
-      has_vol, vol_num, series_size,
-      prev_vol_loan_lag1, series_total_loan_lag1
-  [F] 독자 인구통계 (loan_groups)
-      female_ratio, main_age_group_enc
-  [G] 순위 이력 (loan_history)
-      ranking_trend, ranking_mean
-  [H] 시간
-      month_num, season_enc, is_vacation, is_semester_start
-
-타겟:
-  DemandScore = 0.7 * norm_loan + 0.3 * norm_gain
-  (NLP 컴포넌트 제거, train 통계 기준 정규화)
-
-데이터 누수 방지:
-  모든 lag/hist 피처는 target_yyyymm 이전 기간 값만 사용.
-  rank_gain_for_target 은 타겟 구성 전용 (out_cols 제외).
-  loanCnt_total, co_loan_count 는 전체 누적값 (PoC 허용).
-
-Usage:
-    python data/process.py [--window-size 3]
-    python data/process.py --years 2023 2024 2025 --window-size 3
-
-Output:
-    data/processed/features_book.csv
-    data/processed/feature_info.json
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -59,11 +14,10 @@ PROCESSED_DIR = Path(__file__).resolve().parent / "processed"
 PROCESSED_DIR.mkdir(exist_ok=True)
 
 YEARS     = [2023, 2024, 2025]
-TRAIN_END = 202409   # 2023-01 ~ 2024-09 → train
-VAL_END   = 202411   # 2024-10 ~ 2024-11 → val
-# test: 2024-12 이후 (2025 전체)
+TRAIN_END = 202506
+VAL_END   = 202509
 
-RANK_FILL = 5001   # 인기 목록에 없는 경우 대체값
+RANK_FILL = 5001 # 인기 목록에 없는 경우 대체값
 
 SEASON_MAP = {
     1: "winter", 2: "winter",  3: "spring",
@@ -75,7 +29,7 @@ VACATION_MONTHS       = {1, 2, 7, 8}
 SEMESTER_START_MONTHS = {3, 9}
 
 
-# ── YYYYMM 유틸 ────────────────────────────────────────────────────────────────
+# YYYYMM 유틸
 
 def prev_yyyymm(yyyymm: int) -> int:
     y, m = divmod(int(yyyymm), 100)
@@ -100,18 +54,11 @@ def split_label(yyyymm: int) -> str:
     return "test"
 
 
-# ── 데이터 로더 ────────────────────────────────────────────────────────────────
+# 데이터 로더
 
 def load_popular_books(
     years: list[int],
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """인기 대출 도서 로드.
-
-    Returns:
-        meta        : ISBN별 도서 메타 DataFrame
-        loan_matrix : pivot(isbn13 × yyyymm) — loan_count
-        rank_matrix : pivot(isbn13 × yyyymm) — ranking (낮을수록 순위 높음)
-    """
     frames: list[pd.DataFrame] = []
     for year in years:
         fpath = RAW_DIR / f"popular_books_{year}.csv"
@@ -143,9 +90,8 @@ def load_popular_books(
     meta["bookname_length"]  = meta["bookname"].str.len().fillna(0).astype(int)
     meta["publication_year"] = pd.to_numeric(meta["publication_year"], errors="coerce")
     meta["book_age"]         = (max(years) - meta["publication_year"]).clip(0, 200)
-    meta["kdc_class"]        = (
-        meta["class_no"].fillna("").str.strip().str[:1].replace("", "unknown")
-    )
+    meta["kdc_class"]     = meta["class_no"].fillna("").str.strip().str[:1].replace("", "unknown")
+    meta["kdc_class_mid"] = meta["class_no"].fillna("").str.strip().str[:2].replace("", "unknown")
 
     # 출판사별 인기 도서 등재 빈도 (관심도 프록시)
     pub_counts = all_df.groupby("isbn13").first()["publisher"].value_counts()
@@ -154,7 +100,10 @@ def load_popular_books(
     )
 
     # 시리즈 피처 기반 컬럼
-    vol_numeric = pd.to_numeric(meta["vol"], errors="coerce").fillna(0)
+    # 상/중/하 -> 1/2/3 매핑 먼저 적용
+    KO_VOL_MAP = {"상": 1, "중": 2, "하": 3, "上": 1, "下": 3}
+    vol_mapped = meta["vol"].map(KO_VOL_MAP)
+    vol_numeric = vol_mapped.fillna(pd.to_numeric(meta["vol"], errors="coerce")).fillna(0)
     # 연도처럼 보이는 값(1900~2099) 제거 (예: "트렌드코리아 2025"의 vol=2025)
     is_year_like = (vol_numeric >= 1900) & (vol_numeric <= 2099)
     meta["vol_num"] = vol_numeric.where(~is_year_like, 0).astype(int)
@@ -247,6 +196,9 @@ def load_co_loan_books() -> pd.DataFrame:
 
 
 def load_loan_history_ranking() -> pd.DataFrame:
+    # [PoC 허용] loan_history_raw 는 API 호출 시점 기준 최근 12개월치이므로
+    # target_yyyymm 이후 순위 정보가 포함될 수 있음.
+    # 정식 구현 시 per-sample 기준으로 target 이전 월만 필터링 필요.
     fpath = RAW_DIR / "loan_history_raw.csv"
     if not fpath.exists():
         return pd.DataFrame(columns=["isbn13", "ranking_trend", "ranking_mean"])
@@ -267,7 +219,7 @@ def load_loan_history_ranking() -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-# ── 슬라이딩 윈도우 샘플 생성 ──────────────────────────────────────────────────
+# 슬라이딩 윈도우 샘플 생성
 
 def build_windows(
     loan_matrix: pd.DataFrame,
@@ -277,7 +229,7 @@ def build_windows(
     """YYYYMM 기반 슬라이딩 윈도우 샘플 생성.
 
     연도 경계를 포함한 연속 구간만 유효 샘플로 처리.
-    각 샘플: feat_months(=window_size 개월) → target_yyyymm(다음 달)
+    각 샘플: feat_months(=window_size 개월) -> target_yyyymm(다음 달)
     """
     all_months  = sorted(int(c) for c in loan_matrix.columns)
     rank_months = set(rank_matrix.columns)
@@ -301,9 +253,19 @@ def build_windows(
 
             sample: dict = {"isbn13": isbn, "target_yyyymm": tgt_yyyymm}
 
-            # [A] 대출 lag 피처 (lag1 = 가장 최근 달)
+            # 대출 lag 피처 (lag1 = 가장 최근 달)
             for j, v in enumerate(reversed(vals)):
                 sample[f"loan_lag{j + 1}"] = v
+
+            # 이동평균 (가능한 경우만)
+            loan_ma_3 = round(float(np.mean(vals[-3:])), 2) if len(vals) >= 3 else round(mean_v, 2)
+            loan_ma_6 = round(float(np.mean(vals[-6:])), 2) if len(vals) >= 6 else round(mean_v, 2)
+
+            # 직전월 대비 증가율
+            if len(vals) >= 2 and vals[-2] > 0:
+                loan_growth_1m = round((vals[-1] - vals[-2]) / vals[-2], 4)
+            else:
+                loan_growth_1m = 0.0
 
             sample.update({
                 "loan_mean":         round(mean_v, 2),
@@ -314,10 +276,13 @@ def build_windows(
                 "loan_cv":           round(std_v / (mean_v + 1e-8), 4),
                 "loan_recent_ratio": round(vals[-1] / (mean_v + 1e-8), 4),
                 "loan_accel":        round(vals[-1] - vals[-2], 2) if window_size >= 2 else 0.0,
+                "loan_ma_3":         loan_ma_3,
+                "loan_ma_6":         loan_ma_6,
+                "loan_growth_1m":    loan_growth_1m,
                 "raw_loan_count":    float(loan_row[tgt_yyyymm]),
             })
 
-            # [B] 랭킹 lag 피처 (낮을수록 순위 높음)
+            # 랭킹 lag 피처 (낮을수록 순위 높음)
             if isbn in rank_matrix.index:
                 rank_row = rank_matrix.loc[isbn]
                 for j, m in enumerate(reversed(feat_months)):
@@ -328,17 +293,24 @@ def build_windows(
                     sample[f"rank_lag{j + 1}"] = float(RANK_FILL)
 
             rank_vals  = [sample[f"rank_lag{j + 1}"] for j in range(window_size)]
-            rank_valid = [v for v in rank_vals if v < RANK_FILL]
+            rank_valid_with_idx = [
+                (j, v) for j, v in enumerate(rank_vals) if v < RANK_FILL
+            ]
             sample["rank_mean"]  = round(float(np.mean(rank_vals)), 2)
             sample["rank_trend"] = (
-                round(float(np.polyfit(range(len(rank_valid)), rank_valid, 1)[0]), 4)
-                if len(rank_valid) >= 2
+                round(float(np.polyfit(
+                    [p[0] for p in rank_valid_with_idx],
+                    [p[1] for p in rank_valid_with_idx],
+                    1
+                )[0]), 4)
+                if len(rank_valid_with_idx) >= 2
                 else 0.0
             )
             # 순위 변동폭 (안정성 지표)
+            rank_only_vals = [p[1] for p in rank_valid_with_idx]
             sample["rank_std"] = (
-                round(float(np.std(rank_valid)), 2)
-                if len(rank_valid) >= 2
+                round(float(np.std(rank_only_vals)), 2)
+                if len(rank_only_vals) >= 2
                 else 0.0
             )
 
@@ -347,7 +319,7 @@ def build_windows(
     return pd.DataFrame(rows)
 
 
-# ── 핫트렌드 구조 피처 ─────────────────────────────────────────────────────────
+# 핫트렌드 구조 피처
 
 def compute_hot_features(
     windows_df: pd.DataFrame,
@@ -432,14 +404,84 @@ def _rank_gain_for_target(
     )
 
 
-# ── 시리즈 피처 ────────────────────────────────────────────────────────────────
+# 키워드 로더 (타겟 구성 전용 — 입력 피처 X에 포함되지 않음)
+
+def load_keywords(years: list[int]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """도서 키워드 + 월별 키워드 로드. 타겟의 trend_score 계산에만 사용."""
+    book_kw_path = RAW_DIR / "book_keywords_raw.csv"
+    book_kw = (
+        pd.read_csv(book_kw_path, dtype={"isbn13": "string"})
+        if book_kw_path.exists()
+        else pd.DataFrame(columns=["isbn13", "word", "weight"])
+    )
+
+    kw_frames: list[pd.DataFrame] = []
+    for year in years:
+        fpath = RAW_DIR / f"monthly_keywords_{year}.csv"
+        if fpath.exists():
+            kw_frames.append(pd.read_csv(fpath))
+    monthly_kw = (
+        pd.concat(kw_frames, ignore_index=True)
+        if kw_frames
+        else pd.DataFrame(columns=["month", "word", "weight"])
+    )
+    monthly_kw["yyyymm"] = monthly_kw["month"].str.replace("-", "").astype(int)
+    return book_kw, monthly_kw
+
+
+def build_isbn_kw_map(book_kw_df: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """{isbn13: {word: weight}} 도서 키워드 사전."""
+    result: dict[str, dict[str, float]] = {}
+    for isbn, grp in book_kw_df.groupby("isbn13"):
+        result[isbn] = dict(zip(
+            grp["word"].dropna().str.strip(),
+            pd.to_numeric(grp["weight"], errors="coerce").fillna(0).tolist(),
+        ))
+    return result
+
+
+def build_month_kw_map(monthly_kw_df: pd.DataFrame) -> dict[int, dict[str, float]]:
+    """{yyyymm: {word: weight}} 월별 키워드 사전."""
+    result: dict[int, dict[str, float]] = {}
+    for yyyymm, grp in monthly_kw_df.groupby("yyyymm"):
+        result[int(yyyymm)] = dict(zip(
+            grp["word"].dropna().str.strip(),
+            pd.to_numeric(grp["weight"], errors="coerce").fillna(0).tolist(),
+        ))
+    return result
+
+
+def _trend_nlp_row(
+    isbn: str,
+    query_yyyymm: int,
+    isbn_kw_map: dict[str, dict[str, float]],
+    month_kw_map: dict[int, dict[str, float]],
+) -> float:
+    """도서 키워드 × 월별 키워드 유사도 (keyword_trend_similarity).
+
+    타겟 구성 전용: query_yyyymm = target_yyyymm (ground truth, 누수 아님).
+    반환값 0~1 스케일.
+    """
+    bw = isbn_kw_map.get(isbn, {})
+    mw = month_kw_map.get(int(query_yyyymm), {})
+    if not bw or not mw:
+        return 0.0
+    # 월별 키워드를 [0,1]로 정규화 → trend_score를 설계상 0~1에 바운딩
+    max_mw = max(mw.values())
+    mw_norm = {w: v / max_mw for w, v in mw.items()}
+    overlap_scores = [bw[w] * mw_norm[w] for w in bw if w in mw_norm]
+    total_bw = sum(bw.values())
+    return round(sum(overlap_scores) / total_bw, 6) if total_bw > 0 else 0.0
+
+
+# 시리즈 피처
 
 def compute_series_features(
     meta: pd.DataFrame,
     loan_matrix: pd.DataFrame,
     windows_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """시리즈 구조 피처.
+    """시리즈 구조 피처 (merge 기반 벡터화).
 
     데이터4라이브러리 API에서 bookname = 시리즈 제목, vol = 권번호.
     같은 bookname 내 다른 vol을 가진 isbn들을 동일 시리즈로 간주.
@@ -449,98 +491,115 @@ def compute_series_features(
       prev_vol_loan_lag1     — 이전 권(vol_num-1)의 lag1 대출 수
       series_total_loan_lag1 — 같은 시리즈 전체 lag1 대출 합계
     """
-    series_meta = meta[meta["has_vol"] == 1].copy()
+    series_meta = meta[meta["has_vol"] == 1][["isbn13", "bookname", "vol_num"]].copy()
 
     if series_meta.empty:
-        windows_df["series_size"]             = 1
-        windows_df["prev_vol_loan_lag1"]      = 0.0
-        windows_df["series_total_loan_lag1"]  = 0.0
+        windows_df = windows_df.copy()
+        windows_df["series_size"]            = 1
+        windows_df["prev_vol_loan_lag1"]     = 0.0
+        windows_df["series_total_loan_lag1"] = 0.0
         return windows_df
 
     # 시리즈 크기
     series_size_map = (
         series_meta.groupby("bookname")["isbn13"]
         .nunique()
-        .to_dict()
+        .rename("series_size")
+        .reset_index()
     )
+    series_meta = series_meta.merge(series_size_map, on="bookname", how="left")
+    series_meta["series_size"] = series_meta["series_size"].fillna(1).astype(int)
 
-    # isbn → (bookname, vol_num) 매핑
-    isbn_info: dict[str, tuple[str, int]] = (
-        series_meta[["isbn13", "bookname", "vol_num"]]
-        .set_index("isbn13")[["bookname", "vol_num"]]
-        .apply(tuple, axis=1)
-        .to_dict()
+    # loan_matrix를 long 형태로 변환
+    loan_long = (
+        loan_matrix.stack()
+        .reset_index()
+        .rename(columns={"isbn13": "isbn13", "level_1": "yyyymm", 0: "loan_count"})
     )
+    loan_long["yyyymm"] = loan_long["yyyymm"].astype(int)
 
-    # bookname → [(vol_num, isbn13)] 역매핑
-    name_to_vols: dict[str, list[tuple[int, str]]] = {}
-    for isbn, (bname, vnum) in isbn_info.items():
-        name_to_vols.setdefault(bname, []).append((vnum, isbn))
+    # windows_df 에 lag1_yyyymm 추가
+    out = windows_df.copy()
+    out["lag1_yyyymm"] = out["target_yyyymm"].apply(lambda t: prev_yyyymm(int(t)))
 
-    loan_idx    = set(loan_matrix.index)
-    loan_cols   = set(loan_matrix.columns)
+    # isbn → (bookname, vol_num, series_size) 매핑
+    out = out.merge(
+        series_meta[["isbn13", "bookname", "vol_num", "series_size"]],
+        on="isbn13", how="left"
+    )
+    out["series_size"] = out["series_size"].fillna(1).astype(int)
 
-    def _get_loan(isbn13: str, yyyymm: int) -> float:
-        if isbn13 in loan_idx and yyyymm in loan_cols:
-            v = loan_matrix.loc[isbn13, yyyymm]
-            return 0.0 if pd.isna(v) else float(v)
-        return 0.0
+    # 시리즈 전체 lag1 합계: 같은 bookname 의 모든 isbn 의 lag1 대출 합산
+    series_loan = (
+        series_meta[["isbn13", "bookname"]]
+        .merge(loan_long, on="isbn13", how="left")
+    )
+    series_loan = series_loan.rename(columns={"yyyymm": "lag1_yyyymm", "loan_count": "series_loan"})
+    series_total = (
+        series_loan.groupby(["bookname", "lag1_yyyymm"])["series_loan"]
+        .sum()
+        .reset_index()
+        .rename(columns={"series_loan": "series_total_loan_lag1"})
+    )
+    out = out.merge(series_total, on=["bookname", "lag1_yyyymm"], how="left")
+    out["series_total_loan_lag1"] = out["series_total_loan_lag1"].fillna(0.0)
 
-    series_sizes    : list[int]   = []
-    prev_loans      : list[float] = []
-    series_totals   : list[float] = []
+    # 이전 권(vol_num - 1) lag1 대출
+    prev_vol = series_meta[["isbn13", "bookname", "vol_num"]].copy()
+    prev_vol["vol_num"] = prev_vol["vol_num"] + 1  # 다음 권이 이전 권을 참조
+    prev_vol = prev_vol.rename(columns={"isbn13": "prev_isbn13", "vol_num": "vol_num"})
+    out = out.merge(
+        prev_vol[["bookname", "vol_num", "prev_isbn13"]],
+        on=["bookname", "vol_num"], how="left"
+    )
+    prev_loan = loan_long.rename(columns={"isbn13": "prev_isbn13", "loan_count": "prev_vol_loan_lag1"})
+    out = out.merge(
+        prev_loan[["prev_isbn13", "yyyymm", "prev_vol_loan_lag1"]].rename(columns={"yyyymm": "lag1_yyyymm"}),
+        on=["prev_isbn13", "lag1_yyyymm"], how="left"
+    )
+    out["prev_vol_loan_lag1"] = out["prev_vol_loan_lag1"].fillna(0.0)
 
-    for _, row in windows_df.iterrows():
-        isbn      = row["isbn13"]
-        lag1_m    = prev_yyyymm(int(row["target_yyyymm"]))
-        info      = isbn_info.get(isbn)
+    # 불필요 임시 컬럼 제거
+    drop_cols = ["bookname", "vol_num", "prev_isbn13", "lag1_yyyymm"]
+    out = out.drop(columns=[c for c in drop_cols if c in out.columns])
 
-        if info is None:
-            series_sizes.append(1)
-            prev_loans.append(0.0)
-            series_totals.append(0.0)
-            continue
-
-        bname, vol_num = info
-
-        # 시리즈 크기
-        series_sizes.append(series_size_map.get(bname, 1))
-
-        # 이전 권 lag1 대출
-        prev_isbn = next(
-            (i for v, i in name_to_vols.get(bname, []) if v == vol_num - 1),
-            None,
-        )
-        prev_loans.append(_get_loan(prev_isbn, lag1_m) if prev_isbn else 0.0)
-
-        # 시리즈 전체 lag1 합계
-        total = sum(_get_loan(i, lag1_m) for _, i in name_to_vols.get(bname, []))
-        series_totals.append(total)
-
-    windows_df = windows_df.copy()
-    windows_df["series_size"]             = series_sizes
-    windows_df["prev_vol_loan_lag1"]      = prev_loans
-    windows_df["series_total_loan_lag1"]  = series_totals
-    return windows_df
+    return out
 
 
-# ── DemandScore 타겟 ───────────────────────────────────────────────────────────
+# DemandScore 타겟
 
 def compute_demand_score(
     windows_df: pd.DataFrame,
     hot_monthly: pd.DataFrame,
+    isbn_kw_map: dict[str, dict[str, float]],
+    month_kw_map: dict[int, dict[str, float]],
 ) -> pd.DataFrame:
-    """DemandScore_v4 = 0.7 * norm_loan + 0.3 * norm_gain.
+    """DemandScore = 0.5 * norm_loan + 0.3 * norm_gain + 0.2 * trend_score.
 
-    NLP 컴포넌트 없음. train 집합 통계로 min-max 정규화.
-    rank_gain_for_target 은 타겟 계산에만 사용 (입력 피처 제외).
+    원래 공식 그대로 유지. train 집합 통계로 min-max 정규화.
+
+    - norm_loan  : raw_loan_count 정규화
+    - norm_gain  : target_yyyymm 당월 hotTrend rank gain 정규화
+    - trend_score: keyword_trend_similarity (0~1) — ground truth label, 누수 아님
+    rank_gain_for_target, trend_score_target 모두 out_cols 에서 제외.
     """
     df = windows_df.copy()
+
+    # rank gain (target 월 내, 타겟 구성 전용)
     rg = _rank_gain_for_target(df, hot_monthly)
     df = df.merge(rg, on=["isbn13", "target_yyyymm"], how="left")
     df["rank_gain_for_target"] = df["rank_gain_for_target"].fillna(0.0)
-    df["split"] = df["target_yyyymm"].apply(split_label)
 
+    # trend score (target 월 키워드 유사도, 타겟 구성 전용)
+    print("[process] Computing trend_score for DemandScore target ...")
+    df["trend_score_target"] = df.apply(
+        lambda r: _trend_nlp_row(
+            r["isbn13"], int(r["target_yyyymm"]), isbn_kw_map, month_kw_map
+        ),
+        axis=1,
+    )
+
+    df["split"] = df["target_yyyymm"].apply(split_label)
     train_mask = df["split"] == "train"
 
     def _minmax(s: pd.Series) -> pd.Series:
@@ -548,20 +607,24 @@ def compute_demand_score(
         mx = s[train_mask].max()
         return (s - mn) / (mx - mn + 1e-8)
 
-    norm_loan = _minmax(df["raw_loan_count"])
-    norm_gain = _minmax(df["rank_gain_for_target"])
-    df["target"] = (0.7 * norm_loan + 0.3 * norm_gain).round(6)
+    norm_loan  = _minmax(df["raw_loan_count"])
+    norm_gain  = _minmax(df["rank_gain_for_target"])
+    norm_trend = df["trend_score_target"]   # 이미 0~1 비율값, 정규화 불필요
+    df["aux_target_log1p"] = np.log1p(df["raw_loan_count"])
+    df["target"] = (0.5 * norm_loan + 0.3 * norm_gain + 0.2 * norm_trend).round(6)
     return df
 
 
-# ── 인코더/피처 정보 저장 ──────────────────────────────────────────────────────
+# 인코더/피처 정보 저장
 
 def save_feature_info(
     le_kdc: LabelEncoder,
+    le_kdc_mid: LabelEncoder,
     le_age: LabelEncoder,
     le_season: LabelEncoder,
     window_size: int,
     norm_stats: dict,
+    years: list[int] | None = None,
 ) -> None:
     def _mapping(le: LabelEncoder) -> dict:
         return dict(zip(le.classes_.tolist(), le.transform(le.classes_).tolist()))
@@ -569,13 +632,14 @@ def save_feature_info(
     info = {
         "version": "v4",
         "description": "Structural features only (no NLP)",
-        "years": YEARS,
+        "years": years if years is not None else YEARS,
         "window_size": window_size,
         "split_boundaries": {"train_end": TRAIN_END, "val_end": VAL_END},
         "kdc_class":      _mapping(le_kdc),
+        "kdc_class_mid":  _mapping(le_kdc_mid),
         "main_age_group": _mapping(le_age),
         "season":         _mapping(le_season),
-        "demand_score_weights": {"norm_loan": 0.7, "norm_gain": 0.3},
+        "demand_score_weights": {"norm_loan": 0.5, "norm_gain": 0.3, "trend_score": 0.2},
         "demand_score_norm_stats": norm_stats,
     }
     path = PROCESSED_DIR / "feature_info.json"
@@ -583,56 +647,57 @@ def save_feature_info(
         json.dump(info, f, ensure_ascii=False, indent=2)
     print(f"[process] Feature info → {path}")
 
+def main(years: list[int] | None = None, window_size: int = 6) -> None:
+    active_years = years if years else YEARS
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    print(f"[process] v4 | years={active_years}  window_size={window_size}")
 
-def main(years: list[int] | None = None, window_size: int = 3) -> None:
-    if years:
-        global YEARS
-        YEARS = years
-
-    print(f"[process] v4 | years={YEARS}  window_size={window_size}")
-
-    # ── 1. 로드 ───────────────────────────────────────────────────────────────
-    book_meta, loan_matrix, rank_matrix = load_popular_books(YEARS)
+    # 1. 로드
+    book_meta, loan_matrix, rank_matrix = load_popular_books(active_years)
     usage_books = load_usage_books()
     loan_groups = load_loan_groups()
-    hot_df      = load_hot_trends(YEARS)
+    hot_df      = load_hot_trends(active_years)
     co_loan     = load_co_loan_books()
     loan_hist   = load_loan_history_ranking()
     hot_monthly = build_hot_monthly(hot_df)
 
+    # 키워드 맵 (타겟 trend_score 계산 전용)
+    book_kw, monthly_kw = load_keywords(active_years)
+    isbn_kw_map  = build_isbn_kw_map(book_kw)
+    month_kw_map = build_month_kw_map(monthly_kw)
+
     print(
         f"[process] ISBNs={len(book_meta):,}  "
         f"loan_matrix={loan_matrix.shape}  "
-        f"hot_monthly={len(hot_monthly):,}"
+        f"hot_monthly={len(hot_monthly):,}  "
+        f"isbn_kw={len(isbn_kw_map):,}  month_kw={len(month_kw_map):,}"
     )
 
-    # ── 2. 슬라이딩 윈도우 ────────────────────────────────────────────────────
+    # 2. 슬라이딩 윈도우
     windows = build_windows(loan_matrix, rank_matrix, window_size)
     print(f"[process] Window samples: {len(windows):,}")
 
-    # ── 3. DemandScore 타겟 + split ───────────────────────────────────────────
-    windows = compute_demand_score(windows, hot_monthly)
+    # 3. DemandScore 타겟 + split
+    windows = compute_demand_score(windows, hot_monthly, isbn_kw_map, month_kw_map)
     print(f"[process] Split: {windows['split'].value_counts().to_dict()}")
 
-    # ── 4. 핫트렌드 구조 피처 ─────────────────────────────────────────────────
+    # 4. 핫트렌드 구조 피처
     print("[process] Computing hot trend structural features ...")
     hot_feats = compute_hot_features(windows, hot_monthly)
 
-    # ── 5. 시리즈 피처 ────────────────────────────────────────────────────────
+    # 5. 시리즈 피처
     print("[process] Computing series features ...")
     windows = compute_series_features(book_meta, loan_matrix, windows)
 
-    # ── 6. 시간 피처 ──────────────────────────────────────────────────────────
+    # 6. 시간 피처
     windows["month_num"]         = windows["target_yyyymm"].apply(month_of)
     windows["season"]            = windows["month_num"].map(SEASON_MAP)
     windows["is_vacation"]       = windows["month_num"].isin(VACATION_MONTHS).astype(int)
     windows["is_semester_start"] = windows["month_num"].isin(SEMESTER_START_MONTHS).astype(int)
 
-    # ── 7. 피처 JOIN ──────────────────────────────────────────────────────────
+    # 7. 피처 JOIN
     meta_cols = [
-        "isbn13", "bookname_length", "book_age", "kdc_class",
+        "isbn13", "bookname_length", "book_age", "kdc_class", "kdc_class_mid",
         "vol_num", "has_vol", "publisher_pop_count",
     ]
     df = (
@@ -645,7 +710,7 @@ def main(years: list[int] | None = None, window_size: int = 3) -> None:
         .merge(loan_hist,                                  on="isbn13", how="left")
     )
 
-    # ── 8. 결측 처리 ──────────────────────────────────────────────────────────
+    # 8. 결측 처리
     fill_zero = [
         "loanCnt_total", "co_loan_count",
         "ranking_trend", "ranking_mean",
@@ -661,25 +726,28 @@ def main(years: list[int] | None = None, window_size: int = 3) -> None:
     df["ht_rank_best_hist"] = df["ht_rank_best_hist"].fillna(float(RANK_FILL))
     df["book_age"]          = df["book_age"].fillna(df["book_age"].median())
 
-    # ── 9. 범주형 인코딩 (train 카테고리로만 fit) ─────────────────────────────
-    le_kdc    = LabelEncoder()
-    le_age    = LabelEncoder()
-    le_season = LabelEncoder()
+    # 9. 범주형 인코딩 (train 카테고리로만 fit)
+    le_kdc     = LabelEncoder()
+    le_kdc_mid = LabelEncoder()
+    le_age     = LabelEncoder()
+    le_season  = LabelEncoder()
 
     train_df = df[df["split"] == "train"]
     le_kdc.fit(train_df["kdc_class"].fillna("unknown"))
+    le_kdc_mid.fit(train_df["kdc_class_mid"].fillna("unknown"))
     le_age.fit(train_df["main_age_group"].fillna("unknown"))
     le_season.fit(train_df["season"])
 
     def _safe_enc(le: LabelEncoder, s: pd.Series) -> pd.Series:
-        known = set(le.classes_)
-        return s.map(lambda x: int(le.transform([x])[0]) if x in known else -1)
+        mapping = {cls: int(i) for i, cls in enumerate(le.classes_)}
+        return s.map(lambda x: mapping.get(x, -1))
 
-    df["kdc_class_enc"]      = _safe_enc(le_kdc,    df["kdc_class"].fillna("unknown"))
-    df["main_age_group_enc"] = _safe_enc(le_age,    df["main_age_group"].fillna("unknown"))
-    df["season_enc"]         = _safe_enc(le_season, df["season"])
+    df["kdc_class_enc"]      = _safe_enc(le_kdc,     df["kdc_class"].fillna("unknown"))
+    df["kdc_class_mid_enc"]  = _safe_enc(le_kdc_mid, df["kdc_class_mid"].fillna("unknown"))
+    df["main_age_group_enc"] = _safe_enc(le_age,     df["main_age_group"].fillna("unknown"))
+    df["season_enc"]         = _safe_enc(le_season,  df["season"])
 
-    # ── 10. 피처 정보 저장 ────────────────────────────────────────────────────
+    # 10. 피처 정보 저장
     train_mask = df["split"] == "train"
     norm_stats = {
         "loan_min": float(df.loc[train_mask, "raw_loan_count"].min()),
@@ -687,38 +755,40 @@ def main(years: list[int] | None = None, window_size: int = 3) -> None:
         "gain_min": float(df.loc[train_mask, "rank_gain_for_target"].min()),
         "gain_max": float(df.loc[train_mask, "rank_gain_for_target"].max()),
     }
-    save_feature_info(le_kdc, le_age, le_season, window_size, norm_stats)
+    save_feature_info(le_kdc, le_kdc_mid, le_age, le_season, window_size, norm_stats, active_years)
 
-    # ── 11. 출력 컬럼 선택 ────────────────────────────────────────────────────
+    # 11. 출력 컬럼 선택
     lag_cols  = [f"loan_lag{i + 1}"  for i in range(window_size)]
     rank_cols = [f"rank_lag{i + 1}"  for i in range(window_size)]
 
     out_cols = (
         ["isbn13", "target_yyyymm", "split"]
-        # [A] 대출 시계열
+        # 대출 시계열
         + lag_cols
         + ["loan_mean", "loan_max", "loan_min", "loan_recent",
-           "loan_trend", "loan_cv", "loan_recent_ratio", "loan_accel"]
-        # [B] 랭킹
+           "loan_trend", "loan_cv", "loan_recent_ratio", "loan_accel",
+           "loan_ma_3", "loan_ma_6", "loan_growth_1m"]
+        # 랭킹
         + rank_cols
         + ["rank_mean", "rank_trend", "rank_std"]
-        # [C] 핫트렌드 구조
+        # 핫트렌드 구조
         + ["hot_trend_recency", "rank_gain_lag1",
            "hot_trend_count_hist", "rank_gain_max_hist", "ht_rank_best_hist"]
-        # [D] 도서 메타
-        + ["bookname_length", "book_age", "kdc_class_enc",
+        # 도서 메타
+        + ["bookname_length", "book_age", "kdc_class_enc", "kdc_class_mid_enc",
            "publisher_pop_count", "loanCnt_total", "co_loan_count"]
-        # [E] 시리즈
+        # 시리즈
         + ["has_vol", "vol_num", "series_size",
            "prev_vol_loan_lag1", "series_total_loan_lag1"]
-        # [F] 독자 인구통계
+        # 독자 인구통계
         + ["female_ratio", "main_age_group_enc"]
-        # [G] 순위 이력
+        # 순위 이력
         + ["ranking_trend", "ranking_mean"]
-        # [H] 시간
+        # 시간
         + ["month_num", "season_enc", "is_vacation", "is_semester_start"]
-        # 타겟
-        + ["target"]
+        # aux_target_log1p : log1p(raw_loan_count) — 타겟 보조 실험용, 피처(X)로 사용 금지
+        # 타겟 (aux_ 컬럼은 모델 입력 X에 포함 금지)
+        + ["aux_target_log1p", "target"]
     )
     out_cols = [c for c in out_cols if c in df.columns]
     out = df[out_cols].dropna(subset=["target"])
@@ -749,8 +819,8 @@ def main(years: list[int] | None = None, window_size: int = 3) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Feature engineering v4 (structural-only)")
-    parser.add_argument("--window-size", type=int, default=3,
-                        help="슬라이딩 윈도우 크기 (기본: 3개월)")
+    parser.add_argument("--window-size", type=int, default=6,
+                        help="슬라이딩 윈도우 크기 (기본: 6개월, 5rd 회의 권장)")
     parser.add_argument("--years", type=int, nargs="+", default=None,
                         help="수집 연도 (기본: 2023 2024 2025)")
     args = parser.parse_args()
