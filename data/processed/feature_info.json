@@ -1,0 +1,38 @@
+{
+  "version": "v4",
+  "description": "Structural features only (no NLP)",
+  "years": [
+    2023,
+    2024,
+    2025
+  ],
+  "window_size": 3,
+  "split_boundaries": {
+    "train_end": 202409,
+    "val_end": 202411
+  },
+  "kdc_class": {
+    "unknown": 0
+  },
+  "main_age_group": {
+    "40대": 0,
+    "50대": 1,
+    "unknown": 2
+  },
+  "season": {
+    "fall": 0,
+    "spring": 1,
+    "summer": 2,
+    "winter": 3
+  },
+  "demand_score_weights": {
+    "norm_loan": 0.7,
+    "norm_gain": 0.3
+  },
+  "demand_score_norm_stats": {
+    "loan_min": 216.0,
+    "loan_max": 5075.0,
+    "gain_min": 0.0,
+    "gain_max": 891.0
+  }
+}
