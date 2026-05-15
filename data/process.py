@@ -90,8 +90,9 @@ def load_popular_books(
     meta["bookname_length"]  = meta["bookname"].str.len().fillna(0).astype(int)
     meta["publication_year"] = pd.to_numeric(meta["publication_year"], errors="coerce")
     meta["book_age"]         = (max(years) - meta["publication_year"]).clip(0, 200)
-    meta["kdc_class"]     = meta["class_no"].fillna("").str.strip().str[:1].replace("", "unknown")
-    meta["kdc_class_mid"] = meta["class_no"].fillna("").str.strip().str[:2].replace("", "unknown")
+    class_no_str = meta["class_no"].astype("string").fillna("").str.strip()
+    meta["kdc_class"]     = class_no_str.str[:1].replace("", "unknown")
+    meta["kdc_class_mid"] = class_no_str.str[:2].replace("", "unknown")
 
     # 출판사별 인기 도서 등재 빈도 (관심도 프록시)
     pub_counts = all_df.groupby("isbn13").first()["publisher"].value_counts()
