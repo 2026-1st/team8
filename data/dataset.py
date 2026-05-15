@@ -20,7 +20,10 @@ load_dotenv(PROJECT_ROOT / ".env")
 API_KEY = os.getenv("LIBRARY_API_KEY")
 
 
-def get_json(endpoint: str, params: dict, retries: int = 3, sleep_sec: float = 1.0) -> dict:
+_RATE_LIMIT_MSG = "500"  # 응답 에러 메시지 식별자
+
+
+def get_json(endpoint: str, params: dict, retries: int = 5, sleep_sec: float = 1.0) -> dict:
     if not API_KEY:
         raise ValueError("LIBRARY_API_KEY가 없습니다. 프로젝트 .env 파일에 추가해주세요.")
 
@@ -42,14 +45,22 @@ def get_json(endpoint: str, params: dict, retries: int = 3, sleep_sec: float = 1
             if "error" in data:
                 raise RuntimeError(f"{endpoint} API 오류: {data['error']}")
 
+            # 중첩된 response.error 감지 (rate limit 등)
+            nested_error = data.get("response", {}).get("error")
+            if nested_error:
+                if _RATE_LIMIT_MSG in str(nested_error):
+                    wait = min(60 * attempt, 300)
+                    print(f"[rate-limit] {wait}초 대기 후 재시도 (attempt {attempt}/{retries})...")
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(f"{endpoint} 응답 오류: {nested_error}")
+
             return data
 
         except (requests.RequestException, ValueError, RuntimeError) as exc:
             last_error = exc
-
             if attempt == retries:
                 break
-
             time.sleep(sleep_sec * attempt)
 
     raise RuntimeError(f"API 요청 실패: {endpoint}, params={params}") from last_error
@@ -161,11 +172,18 @@ def fetch_popular_books_year(year: int) -> pd.DataFrame:
     for start_dt, end_dt, month in month_ranges(year):
         month_path = RAW_DIR / f"popular_books_{month}.csv"
 
-        if month_path.exists():
-            df = pd.read_csv(month_path, dtype={"isbn13": "string"})
-            print(f"[popular] 기존 파일 사용: {month_path.name} rows={len(df)}")
+        loaded = False
+        if month_path.exists() and month_path.stat().st_size > 100:
+            try:
+                df = pd.read_csv(month_path, dtype={"isbn13": "string"})
+                if not df.empty:
+                    print(f"[popular] 기존 파일 사용: {month_path.name} rows={len(df)}")
+                    loaded = True
+            except Exception:
+                print(f"[popular] 손상된 파일 재수집: {month_path.name}")
+                month_path.unlink(missing_ok=True)
 
-        else:
+        if not loaded:
             df = fetch_popular_books_month(start_dt, end_dt)
             df.to_csv(month_path, index=False, encoding="utf-8-sig")
 
@@ -205,14 +223,20 @@ def fetch_monthly_keywords_year(year: int) -> pd.DataFrame:
     for _, _, month in month_ranges(year):
         month_path = RAW_DIR / f"monthly_keywords_{month}.csv"
 
-        if month_path.exists():
-            df = pd.read_csv(month_path)
-            print(f"[keywords] 기존 파일 사용: {month_path.name} rows={len(df)}")
+        loaded = False
+        if month_path.exists() and month_path.stat().st_size > 10:
+            try:
+                df = pd.read_csv(month_path)
+                if not df.empty:
+                    print(f"[keywords] 기존 파일 사용: {month_path.name} rows={len(df)}")
+                    loaded = True
+            except Exception:
+                print(f"[keywords] 손상된 파일 재수집: {month_path.name}")
+                month_path.unlink(missing_ok=True)
 
-        else:
+        if not loaded:
             df = fetch_monthly_keywords(month)
             df.to_csv(month_path, index=False, encoding="utf-8-sig")
-
             print(f"[keywords] 저장 완료: {month_path.name} rows={len(df)}")
             time.sleep(0.2)
 
@@ -275,14 +299,20 @@ def fetch_hot_trends_year(year: int, step_days: int = 3) -> pd.DataFrame:
         search_dt = current.isoformat()
         day_path = RAW_DIR / f"hot_trends_{search_dt}.csv"
 
-        if day_path.exists():
-            df = pd.read_csv(day_path, dtype={"isbn13": "string"})
-            print(f"[hotTrend] 기존 파일 사용: {day_path.name} rows={len(df)}")
+        loaded = False
+        if day_path.exists() and day_path.stat().st_size > 10:
+            try:
+                df = pd.read_csv(day_path, dtype={"isbn13": "string"})
+                if not df.empty:
+                    print(f"[hotTrend] 기존 파일 사용: {day_path.name} rows={len(df)}")
+                    loaded = True
+            except Exception:
+                print(f"[hotTrend] 손상된 파일 재수집: {day_path.name}")
+                day_path.unlink(missing_ok=True)
 
-        else:
+        if not loaded:
             df = fetch_hot_trend(search_dt)
             df.to_csv(day_path, index=False, encoding="utf-8-sig")
-
             print(f"[hotTrend] 저장 완료: {day_path.name} rows={len(df)}")
             time.sleep(0.2)
 
@@ -469,10 +499,15 @@ def parse_usage_limit(value: str) -> int | None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="1년 단위 도서관 빅데이터 API 원천 데이터를 수집합니다."
+        description="도서관 빅데이터 API 원천 데이터를 수집합니다. (단일 연도 또는 범위 지원)"
     )
 
-    parser.add_argument("--year", type=int, default=2025)
+    # 단일 연도 (하위 호환)
+    parser.add_argument("--year", type=int, default=None, help="단일 연도 수집 (예: 2025)")
+
+    # 멀티 연도 범위
+    parser.add_argument("--year-start", type=int, default=None, help="수집 시작 연도 (예: 2023)")
+    parser.add_argument("--year-end", type=int, default=None, help="수집 종료 연도 (예: 2025)")
 
     parser.add_argument(
         "--usage-limit",
@@ -496,40 +531,61 @@ def main():
 
     args = parser.parse_args()
 
-    popular_df = fetch_popular_books_year(args.year)
-    monthly_keywords_df = fetch_monthly_keywords_year(args.year)
+    # 수집 연도 목록 결정
+    if args.year is not None:
+        years = [args.year]
+    elif args.year_start is not None and args.year_end is not None:
+        if args.year_start > args.year_end:
+            parser.error("--year-start는 --year-end보다 작거나 같아야 합니다.")
+        years = list(range(args.year_start, args.year_end + 1))
+    else:
+        years = [2025]
 
-    hot_trend_df = fetch_hot_trends_year(
-        args.year,
-        step_days=args.hot_trend_step_days,
-    )
+    print(f"[config] 수집 연도: {years}")
 
-    print(
-        "[summary] "
-        f"popular_rows={len(popular_df)}, "
-        f"monthly_keyword_rows={len(monthly_keywords_df)}, "
-        f"hot_trend_rows={len(hot_trend_df)}"
-    )
+    all_popular_dfs: list[pd.DataFrame] = []
+    all_hot_trend_dfs: list[pd.DataFrame] = []
+
+    for year in years:
+        print(f"\n{'='*50}")
+        print(f"[year={year}] 수집 시작")
+        print(f"{'='*50}")
+
+        popular_df = fetch_popular_books_year(year)
+        monthly_keywords_df = fetch_monthly_keywords_year(year)
+        hot_trend_df = fetch_hot_trends_year(year, step_days=args.hot_trend_step_days)
+
+        all_popular_dfs.append(popular_df)
+        all_hot_trend_dfs.append(hot_trend_df)
+
+        # 연도별 isbn_candidates 저장 (skip-usage 여부 무관)
+        isbn_list_year = collect_isbns(popular_df, hot_trend_df)
+        isbn_path = RAW_DIR / f"isbn_candidates_{year}.csv"
+        pd.DataFrame({"isbn13": isbn_list_year}).to_csv(
+            isbn_path, index=False, encoding="utf-8-sig"
+        )
+        print(f"[isbn] 저장 완료: {isbn_path} rows={len(isbn_list_year)}")
+
+        print(
+            f"[summary year={year}] "
+            f"popular_rows={len(popular_df)}, "
+            f"monthly_keyword_rows={len(monthly_keywords_df)}, "
+            f"hot_trend_rows={len(hot_trend_df)}, "
+            f"isbn_candidates={len(isbn_list_year)}"
+        )
 
     if args.skip_usage:
+        print("\n[config] --skip-usage: usageAnalysisList 수집을 건너뜁니다.")
         return
 
-    isbn_list = collect_isbns(popular_df, hot_trend_df)
+    # 전체 연도 ISBN 통합 → 중복 제거 후 usage 수집
+    all_popular = pd.concat(all_popular_dfs, ignore_index=True) if all_popular_dfs else pd.DataFrame()
+    all_hot = pd.concat(all_hot_trend_dfs, ignore_index=True) if all_hot_trend_dfs else pd.DataFrame()
+    all_isbns = collect_isbns(all_popular, all_hot)
 
-    isbn_path = RAW_DIR / f"isbn_candidates_{args.year}.csv"
+    print(f"\n[isbn] 전체 연도 통합 ISBN 수: {len(all_isbns)}")
 
-    pd.DataFrame({"isbn13": isbn_list}).to_csv(
-        isbn_path,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    print(f"[isbn] 저장 완료: {isbn_path} rows={len(isbn_list)}")
-
-    fetch_usage_analysis_many(
-        isbn_list,
-        usage_limit=args.usage_limit,
-    )
+    fetch_usage_analysis_many(all_isbns, usage_limit=args.usage_limit)
 
 
 if __name__ == "__main__":
