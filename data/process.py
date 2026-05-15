@@ -90,9 +90,22 @@ def load_popular_books(
     meta["bookname_length"]  = meta["bookname"].str.len().fillna(0).astype(int)
     meta["publication_year"] = pd.to_numeric(meta["publication_year"], errors="coerce")
     meta["book_age"]         = (max(years) - meta["publication_year"]).clip(0, 200)
-    class_no_str = meta["class_no"].astype("string").fillna("").str.strip()
-    meta["kdc_class"]     = class_no_str.str[:1].replace("", "unknown")
-    meta["kdc_class_mid"] = class_no_str.str[:2].replace("", "unknown")
+    # class_no = KDC 주제분류 (한국십진분류). 매뉴얼 p.11 기준 정상 코드는 3자리 (100~999).
+    # raw 데이터 분석 결과: <100 범위에 254개 비정상 값 존재 (입력 오류 또는 분류 미부여).
+    # 정상 범위 밖은 'unknown' 처리하여 분류 일관성 유지.
+    def _kdc_chars(val, n: int) -> str:
+        if pd.isna(val):
+            return "unknown"
+        try:
+            num = float(val)
+        except (ValueError, TypeError):
+            return "unknown"
+        if num < 100 or num >= 1000:        # 정상 KDC(3자리) 범위 밖
+            return "unknown"
+        return str(int(num))[:n]            # 813.62 → 813 → "8" or "81"
+
+    meta["kdc_class"]     = meta["class_no"].apply(lambda x: _kdc_chars(x, 1))
+    meta["kdc_class_mid"] = meta["class_no"].apply(lambda x: _kdc_chars(x, 2))
 
     # 출판사별 인기 도서 등재 빈도 (관심도 프록시)
     pub_counts = all_df.groupby("isbn13").first()["publisher"].value_counts()
