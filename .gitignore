@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 data/raw/
 data/api_manual_text.txt
+data/processed/
